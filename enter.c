@@ -307,7 +307,8 @@ int mutt_enter_string_full(char *buf, size_t buflen, int col,
             if (state->lastchar == 0)
               goto bye;
             // Pressing backspace with text in the command prompt should just beep
-            BEEP();
+            else
+              BEEP();
           }
           else
           {
