@@ -40,6 +40,7 @@
 #define DT_SORT      12   /**< sorting methods */
 #define DT_STRING    13   /**< a string */
 #define DT_SYNONYM   14   /**< synonym for another variable */
+#define DT_SLIST     15   /**< a list of strings */
 
 #define DTYPE(x) ((x) & 0x1f) /**< Mask for the Data Type */
 

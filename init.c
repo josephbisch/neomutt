@@ -3820,6 +3820,7 @@ struct ConfigSet *init_config(size_t size)
   regex_init(cs);
   sort_init(cs);
   string_init(cs);
+  slist_init(cs);
 
   if (!cs_register_variables(cs, MuttVars, 0))
   {
