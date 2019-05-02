@@ -1,0 +1,386 @@
+From 6898c083cac5144b730e478408c526d4889c26aa Mon Sep 17 00:00:00 2001
+From: Kevin McCarthy <kevin@8t8.us>
+Date: Thu, 2 May 2019 12:31:29 -0700
+Subject: Write rfc2231 parameter continuations for long parameters
+
+Previously, Mutt would truncate long attachment filenames, to avoid
+writing an illegal length header line.  This commit is a followup to
+4dcb3ba1, where I reverted an incorrect fix for the problem.
+
+rfc2231_encode_string() now returns a list of continuations, with
+encoding and continuation number suffixes already appended to the
+attribute.  The function tries to keep the line length less than 78
+characters, but the code is a bit imprecise as a trade off for
+simplicity and readability.
+
+Modify mutt_write_mime_header() to loop through the continuations.
+
+Co-authored-by: Richard Russon <rich@flatcap.org>
+---
+ email/rfc2231.c | 179 ++++++++++++++++++++++++++++++++++++++++--------------
+ email/rfc2231.h |   2 +-
+ sendlib.c |  94 ++++++++++++++++------------
+ 3 files changed, 187 insertions(+), 88 deletions(-)
+
+diff --git a/email/rfc2231.c b/email/rfc2231.c
+index 437fdfa1..cf92c2ff 100644
+--- a/email/rfc2231.c
++++ b/email/rfc2231.c
+@@ -310,72 +310,157 @@ static void rfc2231_join_continuations (struct Parameter **head,
+   }
+ }
+ 
+-int rfc2231_encode_string (char **pd)
++struct Parameter *rfc2231_encode_string (const char *attribute, char *value)
+ {
+-  int ext = 0, encode = 0;
+-  char *charset, *s, *t, *e, *d = 0;
+-  size_t slen, dlen = 0;
++  int encode = 0, add_quotes = 0, free_src_value = 0;
++  int split = 0, continuation_number = 0;
++  size_t dest_value_len = 0, max_value_len = 0, cur_value_len = 0;
++  char *cur, *charset = NULL, *src_value = NULL;
++  struct Parameter *result = NULL, *current, **lastp;
++  struct Buffer *cur_attribute, *cur_value;
++
++  cur_attribute = mutt_buffer_pool_get ();
++  cur_value = mutt_buffer_pool_get ();
+ 
+   /*
+-   * A shortcut to detect pure 7bit data.
+-   *
+-   * This should prevent the worst when character set handling
+-   * is flawed.
++   * Perform charset conversion
+    */
+-
+-  for (s = *pd; *s; s++)
+-    if (*s & 0x80)
++  for (cur = value; *cur; cur++)
++    if (*cur < 0x20 || *cur >= 0x7f)
++    {
++      encode = 1;
+       break;
++    }
+ 
+-  if (!*s)
+-    return 0;
+-
+-  if (!Charset || !SendCharset ||
+-      !(charset = mutt_choose_charset (Charset, SendCharset,
+-                                       *pd, strlen (*pd), &d, &dlen)))
++  if (encode)
+   {
+-    charset = safe_strdup (Charset ? Charset : "unknown-8bit");
+-    d = *pd;
+-    dlen = strlen (d);
++    if (Charset && SendCharset)
++      charset = mutt_choose_charset (Charset, SendCharset,
++                                     value, mutt_strlen (value),
++                                     &src_value, NULL);
++    if (src_value)
++      free_src_value = 1;
++    if (!charset)
++      charset = safe_strdup (Charset ? Charset : "unknown-8bit");
+   }
++  if (!src_value)
++    src_value = value;
++
++  /*
++   * Count the size the resultant value will need in total.
++   */
++  if (encode)
++    dest_value_len = mutt_strlen (charset) + 2;  /* charset'' prefix */
+ 
+-  if (!mutt_is_us_ascii (charset))
+-    encode = 1;
++  for (cur = src_value; *cur; cur++)
++  {
++    dest_value_len++;
++
++    if (encode)
++    {
++      /* These get converted to %xx so need a total of three chars */
++      if (*cur < 0x20 || *cur >= 0x7f ||
++          strchr (MimeSpecials, *cur) ||
++          strchr ("*'%", *cur))
++      {
++        dest_value_len += 2;
++      }
++    }
++    else
++    {
++      /* rfc822_cat() will add outer quotes if it finds MimeSpecials. */
++      if (!add_quotes && strchr (MimeSpecials, *cur))
++        add_quotes = 1;
++      /* rfc822_cat() will add a backslash if it finds '\' or '"'. */
++      if (*cur == '\\' || *cur == '"')
++        dest_value_len++;
++    }
++  }
+ 
+-  for (s = d, slen = dlen; slen; s++, slen--)
+-    if (*s < 0x20 || *s >= 0x7f)
+-      encode = 1, ++ext;
+-    else if (strchr (MimeSpecials, *s) || strchr ("*'%", *s))
+-      ++ext;
++  /*
++   * Determine if need to split into parameter value continuations
++   */
++  max_value_len =
++    78                      -    /* rfc suggested line length */
++    1                       -    /* Leading tab on continuation line */
++    mutt_strlen (attribute) -    /* attribute */
++    (encode ? 1 : 0)        -    /* '*' encoding marker */
++    1                       -    /* '=' */
++    (add_quotes ? 2 : 0)    -    /* "...." */
++    1;                           /* ';' */
++
++  if (max_value_len < 30)
++    max_value_len = 30;
++
++  if (dest_value_len > max_value_len)
++  {
++    split = 1;
++    max_value_len -= 4;          /* '*n' continuation number and extra encoding
++                                  * space to keep loop below simpler */
++  }
+ 
++  /*
++   * Generate list of parameter continuations.
++   */
++  lastp = &result;
++  cur = src_value;
+   if (encode)
+   {
+-    e = safe_malloc (dlen + 2*ext + strlen (charset) + 3);
+-    sprintf (e, "%s''", charset);        /* __SPRINTF_CHECKED__ */
+-    t = e + strlen (e);
+-    for (s = d, slen = dlen; slen; s++, slen--)
+-      if (*s < 0x20 || *s >= 0x7f ||
+-          strchr (MimeSpecials, *s) || strchr ("*'%", *s))
++    mutt_buffer_printf (cur_value, "%s''", charset);
++    cur_value_len = mutt_buffer_len (cur_value);
++  }
++
++  while (*cur)
++  {
++    *lastp = current = mutt_new_parameter ();
++    lastp = &current->next;
++    mutt_buffer_strcpy (cur_attribute, attribute);
++    if (split)
++      mutt_buffer_add_printf (cur_attribute, "*%d", continuation_number++);
++    if (encode)
++      mutt_buffer_addch (cur_attribute, '*');
++
++    while (*cur && (!split || cur_value_len < max_value_len))
++    {
++      if (encode)
+       {
+-        sprintf (t, "%%%02X", (unsigned char)*s);
+-        t += 3;
++        if (*cur < 0x20 || *cur >= 0x7f ||
++            strchr (MimeSpecials, *cur) ||
++            strchr ("*'%", *cur))
++        {
++          mutt_buffer_add_printf (cur_value, "%%%02X", (unsigned char)*cur);
++          cur_value_len += 3;
++        }
++        else
++        {
++          mutt_buffer_addch (cur_value, *cur);
++          cur_value_len++;
++        }
+       }
+       else
+-        *t++ = *s;
+-    *t = '\0';
++      {
++        mutt_buffer_addch (cur_value, *cur);
++        cur_value_len++;
++        if (*cur == '\\' || *cur == '"')
++          cur_value_len++;
++      }
+ 
+-    if (d != *pd)
+-      FREE (&d);
+-    FREE (pd);                /* __FREE_CHECKED__ */
+-    *pd = e;
+-  }
+-  else if (d != *pd)
+-  {
+-    FREE (pd);                /* __FREE_CHECKED__ */
+-    *pd = d;
++      cur++;
++    }
++
++    current->attribute = safe_strdup (mutt_b2s (cur_attribute));
++    current->value = safe_strdup (mutt_b2s (cur_value));
++
++    mutt_buffer_reset (cur_value);
++    cur_value_len = 0;
+   }
+ 
++  mutt_buffer_pool_release (&cur_attribute);
++  mutt_buffer_pool_release (&cur_value);
++
+   FREE (&charset);
++  if (free_src_value)
++    FREE (&src_value);
+ 
+-  return encode;
++  return result;
+ }
+diff --git a/email/rfc2231.h b/email/rfc2231.h
+index b5f59c1e..90c35c54 100644
+--- a/email/rfc2231.h
++++ b/email/rfc2231.h
+@@ -20,4 +20,4 @@
+  */
+ 
+ void rfc2231_decode_parameters (struct Parameter **);
+-int rfc2231_encode_string (char **);
++struct Parameter *rfc2231_encode_string (const char *, char *);
+diff --git a/sendlib.c b/sendlib.c
+index 4acb6469..6f8b556f 100644
+--- a/sendlib.c
++++ b/sendlib.c
+@@ -294,12 +294,12 @@ static void encode_8bit (FGETCONV *fc, FILE *fout, int istext)
+ int mutt_write_mime_header (struct Body *a, FILE *f)
+ {
+   struct Parameter *p;
++  struct Parameter *param_conts, *cont;
+   char buffer[256];
+   char *t;
+   char *fn;
+   int len;
+   int tmplen;
+-  int encode;
+ 
+   fprintf (f, "Content-Type: %s/%s", TYPE (a), a->subtype);
+ 
+@@ -309,43 +309,41 @@ int mutt_write_mime_header (struct Body *a, FILE *f)
+ 
+     for (p = a->parameter; p; p = p->next)
+     {
+-      char *tmp;
+-
+       if (!p->value)
+         continue;
+ 
+-      fputc (';', f);
+-
+-      buffer[0] = 0;
+-      tmp = safe_strdup (p->value);
+-      encode = rfc2231_encode_string (&tmp);
+-      rfc822_cat (buffer, sizeof (buffer), tmp, MimeSpecials);
+-
+-      /* Dirty hack to make messages readable by Outlook Express
+-       * for the Mac: force quotes around the boundary parameter
+-       * even when they aren't needed.
+-       */
+-
+-      if (!ascii_strcasecmp (p->attribute, "boundary") && !strcmp (buffer, tmp))
+-        snprintf (buffer, sizeof (buffer), "\"%s\"", tmp);
+-
+-      FREE (&tmp);
+-
+-      tmplen = mutt_strlen (buffer) + mutt_strlen (p->attribute) + 1;
+-
+-      if (len + tmplen + 2 > 76)
++      param_conts = rfc2231_encode_string (p->attribute, p->value);
++      for (cont = param_conts; cont; cont = cont->next)
+       {
+-        fputs ("\n\t", f);
+-        len = tmplen + 8;
+-      }
+-      else
+-      {
+-        fputc (' ', f);
+-        len += tmplen + 1;
+-      }
++        fputc (';', f);
++
++        buffer[0] = 0;
++        rfc822_cat (buffer, sizeof (buffer), cont->value, MimeSpecials);
++
++        /* Dirty hack to make messages readable by Outlook Express
++         * for the Mac: force quotes around the boundary parameter
++         * even when they aren't needed.
++         */
++        if (!ascii_strcasecmp (cont->attribute, "boundary") &&
++            !mutt_strcmp (buffer, cont->value))
++          snprintf (buffer, sizeof (buffer), "\"%s\"", cont->value);
++
++        tmplen = mutt_strlen (buffer) + mutt_strlen (cont->attribute) + 1;
++        if (len + tmplen + 2 > 76)
++        {
++          fputs ("\n\t", f);
++          len = tmplen + 1;
++        }
++        else
++        {
++          fputc (' ', f);
++          len += tmplen + 1;
++        }
+ 
+-      fprintf (f, "%s%s=%s", p->attribute, encode ? "*" : "", buffer);
++        fprintf (f, "%s=%s", cont->attribute, buffer);
++      }
+ 
++      mutt_free_parameter (&param_conts);
+     }
+   }
+ 
+@@ -365,6 +363,7 @@ int mutt_write_mime_header (struct Body *a, FILE *f)
+     if (a->disposition < sizeof(dispstr)/sizeof(char*))
+     {
+       fprintf (f, "Content-Disposition: %s", dispstr[a->disposition]);
++      len = 21 + mutt_strlen (dispstr[a->disposition]);
+ 
+       if (a->use_disp)
+       {
+@@ -373,20 +372,35 @@ int mutt_write_mime_header (struct Body *a, FILE *f)
+ 
+         if (fn)
+         {
+-          char *tmp;
+-
+           /* Strip off the leading path... */
+           if ((t = strrchr (fn, '/')))
+             t++;
+           else
+             t = fn;
+ 
+-          buffer[0] = 0;
+-          tmp = safe_strdup (t);
+-          encode = rfc2231_encode_string (&tmp);
+-          rfc822_cat (buffer, sizeof (buffer), tmp, MimeSpecials);
+-          FREE (&tmp);
+-          fprintf (f, "; filename%s=%s", encode ? "*" : "", buffer);
++          param_conts = rfc2231_encode_string ("filename", t);
++          for (cont = param_conts; cont; cont = cont->next)
++          {
++            fputc (';', f);
++            buffer[0] = 0;
++            rfc822_cat (buffer, sizeof (buffer), cont->value, MimeSpecials);
++
++            tmplen = mutt_strlen (buffer) + mutt_strlen (cont->attribute) + 1;
++            if (len + tmplen + 2 > 76)
++            {
++              fputs ("\n\t", f);
++              len = tmplen + 1;
++            }
++            else
++            {
++              fputc (' ', f);
++              len += tmplen + 1;
++            }
++
++            fprintf (f, "%s=%s", cont->attribute, buffer);
++          }
++
++          mutt_free_parameter (&param_conts);
+         }
+       }
+ 
