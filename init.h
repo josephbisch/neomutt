@@ -1572,6 +1572,15 @@ struct ConfigDef MuttVars[] = {
   ** as folder separators for displaying IMAP paths. In particular it
   ** helps in using the "=" shortcut for your \fIfolder\fP variable.
   */
+  { "imap_rfc5161", DT_BOOL, R_NONE, &C_ImapRfc5161, true },
+  /*
+  ** .pp
+  ** When \fIset\fP, NeoMutt will use the IMAP ENABLE extension (RFC 5161) to
+  ** select CAPABILITIES. Some servers (notably Coremail System IMap Server) do
+  ** not properly respond to ENABLE commands, which might cause NeoMutt to hang.
+  ** If your connection seems to freeze at login, try unsetting this. See also
+  ** https://github.com/neomutt/neomutt/issues/1689
+  */
   { "imap_headers",     DT_STRING, R_INDEX, &C_ImapHeaders, 0 },
   /*
   ** .pp
