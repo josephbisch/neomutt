@@ -465,5 +465,8 @@ include doc/Makefile
 @if ENABLE_UNIT_TESTS
 include test/Makefile
 @endif
+@if ENABLE_FUZZ_TESTS
+include fuzz/Makefile
+@endif
 
 # vim: set ts=8 noexpandtab:

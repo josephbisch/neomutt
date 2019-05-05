@@ -47,6 +47,7 @@ test/string-test
 test/tags-test
 test/thread-test
 test/url-test
+fuzz/address-fuzz
 
 # Build products
 *.o
